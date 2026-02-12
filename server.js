@@ -131,10 +131,13 @@ async function upsertContact({ name, email, phone, customFields }) {
     name: String(name || "Unknown"),
     email: String(email || ""),
     ...(phone ? { phone: String(phone) } : {}),
-    customFields: Object.entries(customFields).map(([key, value]) => ({
-      id: key,
-      value: value
-    }))
+    customFields: Object.entries(customFields).map(([key, value]) => {
+      // If the key starts with 'contact.', it's a Unique Key, otherwise it's an ID
+      if (key.startsWith("contact.")) {
+        return { key: key, value: value };
+      }
+      return { id: key, value: value };
+    })
   };
 
   console.log(`[Upsert Contact] Data:`, JSON.stringify(body));
