@@ -27,11 +27,17 @@ const {
 const PORT = Number(process.env.PORT) || 8080;
 
 // Parse Mappings
+// Format: email:calendarId:userId
 const calendarMap = new Map();
 if (CALENDAR_MAPPING) {
   CALENDAR_MAPPING.split(",").forEach(item => {
-    const [email, id] = item.split(":");
-    if (email && id) calendarMap.set(email.trim().toLowerCase(), id.trim());
+    const parts = item.split(":");
+    const email = parts[0]?.trim().toLowerCase();
+    const calId = parts[1]?.trim();
+    const userId = parts[2]?.trim();
+    if (email && calId) {
+      calendarMap.set(email, { calId, userId });
+    }
   });
 }
 
@@ -39,7 +45,7 @@ const fieldMap = new Map();
 if (CUSTOM_FIELD_MAPPING) {
   CUSTOM_FIELD_MAPPING.split(",").forEach(item => {
     const [label, key] = item.split(":");
-    if (label && key) fieldMap.set(label.trim(), key.trim());
+    if (label && key) fieldMap.set(label.trim().toLowerCase(), key.trim());
   });
 }
 
@@ -77,9 +83,11 @@ function extractCustomFields(payload) {
   for (const [targetLabel, ghlKey] of fieldMap.entries()) {
     let found = false;
     for (const key in responses) {
-      const actualLabel = responses[key]?.label || "";
-      // Clean both labels for a more robust match (trim and normalize whitespace)
-      if (actualLabel.trim().replace(/\s+/g, ' ') === targetLabel.trim().replace(/\s+/g, ' ')) {
+      // Clean and normalize labels for fuzzy matching
+      const actualLabel = (responses[key]?.label || "").trim().toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ');
+      const normalizedTarget = targetLabel.trim().toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ');
+
+      if (actualLabel === normalizedTarget) {
         fields[ghlKey] = responses[key].value;
         console.log(`[Debug] Match found! Label: "${targetLabel}" -> GHL Key: "${ghlKey}", Value: "${responses[key].value}"`);
         found = true;
@@ -132,7 +140,6 @@ async function upsertContact({ name, email, phone, customFields }) {
     email: String(email || ""),
     ...(phone ? { phone: String(phone) } : {}),
     customFields: Object.entries(customFields).map(([key, value]) => {
-      // If the key starts with 'contact.', it's a Unique Key, otherwise it's an ID
       if (key.startsWith("contact.")) {
         return { key: key, value: value };
       }
@@ -147,7 +154,7 @@ async function upsertContact({ name, email, phone, customFields }) {
   return contactId;
 }
 
-async function createAppointment({ contactId, startTime, endTime, title, calendarId }) {
+async function createAppointment({ contactId, startTime, endTime, title, calendarId, assignedUserId }) {
   const body = {
     locationId: GHL_LOCATION_ID,
     calendarId: calendarId,
@@ -155,8 +162,8 @@ async function createAppointment({ contactId, startTime, endTime, title, calenda
     title: String(title || "LunaCal Booking"),
     startTime: String(startTime),
     endTime: String(endTime),
-    // Added to bypass slot validation errors
-    ignoreFreeSlotValidation: true
+    ignoreFreeSlotValidation: true,
+    ...(assignedUserId ? { assignedUserId } : {})
   };
 
   console.log(`[Create Appointment] Data:`, JSON.stringify(body));
@@ -189,48 +196,46 @@ app.post("/webhooks/lunacal", async (req, res) => {
     const { name, email, phone } = extractAttendee(payload);
     const customFields = extractCustomFields(payload);
 
-    // Identify Calendar ID
+    // Identify Calendar and User ID
     let organizerEmail = payload?.organizer?.email?.toLowerCase() || "";
     console.log(`[Organizer Email] ${organizerEmail}`);
     
-    // Robust check: if it's suraj.kumar, treat .in and .com the same
+    // Robust check for suraj.kumar domain
     if (organizerEmail.includes("suraj.kumar@digitalwebsolutions")) {
         organizerEmail = "suraj.kumar@digitalwebsolutions.in";
     }
 
-    let targetCalendarId = process.env.GHL_CALENDAR_ID; // Default
+    let targetCalendarId = process.env.GHL_CALENDAR_ID;
+    let targetUserId = null;
 
     if (organizerEmail && calendarMap.has(organizerEmail)) {
-      targetCalendarId = calendarMap.get(organizerEmail);
-      console.log(`[Calendar Match] Found specific calendar: ${targetCalendarId}`);
+      const mapping = calendarMap.get(organizerEmail);
+      targetCalendarId = mapping.calId;
+      targetUserId = mapping.userId;
+      console.log(`[Match] Found mapping: Calendar=${targetCalendarId}, User=${targetUserId}`);
     } else {
-      console.log(`[Calendar Match] Using default/fallback calendar: ${targetCalendarId}`);
+      console.log(`[Match] Using default calendar fallback.`);
     }
 
     if (!email || !startTime || !endTime || !targetCalendarId) {
-      console.error("[Validation Error] Missing required fields:", { email, startTime, endTime, targetCalendarId });
-      return res.status(400).json({ 
-        ok: false, 
-        message: "Missing required fields", 
-        debug: { email, startTime, endTime, targetCalendarId } 
-      });
+      console.error("[Validation Error] Missing required fields");
+      return res.status(400).json({ ok: false, message: "Missing required fields" });
     }
 
-    console.log(`[Sync] Starting sync for ${email}`);
     const contactId = await upsertContact({ name, email, phone, customFields });
-    
-    if (!contactId) {
-      throw new Error("Failed to get contactId from GHL");
-    }
-
-    const appointment = await createAppointment({ contactId, startTime, endTime, title, calendarId: targetCalendarId });
-    console.log(`[Sync] Appointment created successfully:`, JSON.stringify(appointment));
+    const appointment = await createAppointment({ 
+      contactId, 
+      startTime, 
+      endTime, 
+      title, 
+      calendarId: targetCalendarId,
+      assignedUserId: targetUserId
+    });
 
     return res.status(200).json({ 
       ok: true, 
       message: "Synced to GoHighLevel", 
       contactId, 
-      calendarId: targetCalendarId,
       appointmentId: appointment?.id
     });
   } catch (err) {
@@ -243,5 +248,4 @@ app.get("/health", (req, res) => res.status(200).json({ ok: true, message: "heal
 
 app.listen(PORT, () => {
   console.log(`✅ Server listening on port: ${PORT}`);
-  console.log(`CALENDAR_MAPPING set for: ${Array.from(calendarMap.keys()).join(", ")}`);
 });
