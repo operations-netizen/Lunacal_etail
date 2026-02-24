@@ -44,8 +44,12 @@ if (CALENDAR_MAPPING) {
 const fieldMap = new Map();
 if (CUSTOM_FIELD_MAPPING) {
   CUSTOM_FIELD_MAPPING.split(",").forEach(item => {
-    const [label, key] = item.split(":");
-    if (label && key) fieldMap.set(label.trim().toLowerCase(), key.trim());
+    const lastColonIndex = item.lastIndexOf(":");
+    if (lastColonIndex !== -1) {
+      const label = item.substring(0, lastColonIndex).trim().toLowerCase();
+      const key = item.substring(lastColonIndex + 1).trim();
+      if (label && key) fieldMap.set(label, key);
+    }
   });
 }
 
@@ -64,9 +68,24 @@ function normalizeTime(v) {
 function extractAttendee(payload) {
   try {
     const attendee = Array.isArray(payload?.attendees) ? payload.attendees[0] : null;
-    const name = attendee?.name || payload?.responses?.name?.value || payload?.invitee?.name || payload?.name || "Unknown";
-    const email = attendee?.email || payload?.responses?.email?.value || payload?.invitee?.email || payload?.email || null;
-    const phone = attendee?.phone || payload?.responses?.phone?.value || payload?.invitee?.phone || payload?.phone || null;
+    const responses = payload?.responses || {};
+    
+    const name = attendee?.name || responses?.name?.value || payload?.invitee?.name || payload?.name || "Unknown";
+    const email = attendee?.email || responses?.email?.value || payload?.invitee?.email || payload?.email || null;
+    
+    // Improved phone extraction to match "Your Phone Number" and other common labels
+    let phone = attendee?.phone || responses?.phone?.value || payload?.invitee?.phone || payload?.phone || null;
+    
+    if (!phone) {
+        for (const key in responses) {
+            const label = (responses[key]?.label || "").toLowerCase();
+            if (label.includes("phone") || label.includes("mobile") || label.includes("contact")) {
+                phone = responses[key].value;
+                break;
+            }
+        }
+    }
+
     return { name, email, phone };
   } catch (err) {
     console.error("Error extracting attendee:", err.message);
@@ -75,9 +94,11 @@ function extractAttendee(payload) {
 }
 
 function extractCustomFields(payload) {
-  const fields = {};
+  const customFields = [];
+  const standardFields = {};
   const responses = payload?.responses || {};
   
+  console.log("[Debug] Full LunaCal Responses Labels:", Object.values(responses).map(r => r.label));
   console.log("[Debug] Mapping labels to GHL keys:", Array.from(fieldMap.entries()));
 
   for (const [targetLabel, ghlKey] of fieldMap.entries()) {
@@ -87,9 +108,23 @@ function extractCustomFields(payload) {
       const actualLabel = (responses[key]?.label || "").trim().toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ');
       const normalizedTarget = targetLabel.trim().toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ');
 
-      if (actualLabel === normalizedTarget) {
+      if (actualLabel === normalizedTarget || actualLabel.includes(normalizedTarget)) {
         const rawValue = responses[key].value;
-        fields[ghlKey] = rawValue;
+        
+        // Handle "contact." prefix or specific IDs
+        if (ghlKey.startsWith("contact.")) {
+          const fieldName = ghlKey.replace("contact.", "");
+          const topLevelFields = ["address1", "city", "state", "country", "postalCode", "companyName", "website", "dateOfBirth"];
+          
+          if (topLevelFields.includes(fieldName)) {
+            standardFields[fieldName] = rawValue;
+          } else {
+            customFields.push({ id: fieldName, field_value: rawValue });
+          }
+        } else {
+          customFields.push({ id: ghlKey, field_value: rawValue });
+        }
+
         console.log(`[Debug] Match found! Label: "${targetLabel}" -> GHL Key: "${ghlKey}", Value: "${rawValue}"`);
         found = true;
         break;
@@ -99,7 +134,7 @@ function extractCustomFields(payload) {
       console.log(`[Debug] No match found for label: "${targetLabel}"`);
     }
   }
-  return fields;
+  return { customFields, standardFields };
 }
 
 // ============ GHL API ============
@@ -134,20 +169,16 @@ async function ghlRequest(path, { method = "GET", body } = {}) {
   return data;
 }
 
-async function upsertContact({ name, email, phone, customFields, tags }) {
+async function upsertContact({ name, email, phone, customFields, standardFields, tags }) {
   const body = {
     locationId: GHL_LOCATION_ID,
     name: String(name || "Unknown"),
     email: String(email || ""),
     source: "Lunacal",
+    ...standardFields,
     ...(phone ? { phone: String(phone) } : {}),
     ...(tags && tags.length > 0 ? { tags } : {}),
-    customFields: Object.entries(customFields).map(([key, value]) => {
-      if (key.startsWith("contact.")) {
-        return { key: key, value: value };
-      }
-      return { id: key, value: value };
-    })
+    customFields: customFields
   };
 
   console.log(`[Upsert Contact] Data:`, JSON.stringify(body));
@@ -197,13 +228,13 @@ app.post("/webhooks/lunacal", async (req, res) => {
     const endTime = normalizeTime(payload?.endTime || payload?.end);
     const title = String(payload?.eventTitle || payload?.title || "LunaCal Booking");
     const { name, email, phone } = extractAttendee(payload);
-    const customFields = extractCustomFields(payload);
+    const { customFields, standardFields } = extractCustomFields(payload);
 
     // Identify Calendar and User ID
     let organizerEmail = payload?.organizer?.email?.toLowerCase() || "";
     console.log(`[Organizer Email] ${organizerEmail}`);
     
-    // Robust check for suraj.kumar domain
+    // Domain normalization logic
     if (organizerEmail.includes("suraj.kumar@digitalwebsolutions")) {
         organizerEmail = "suraj.kumar@digitalwebsolutions.in";
     }
@@ -225,10 +256,10 @@ app.post("/webhooks/lunacal", async (req, res) => {
       return res.status(400).json({ ok: false, message: "Missing required fields" });
     }
 
-    // Add the specific tag requested by the user
+    // Default tag for etail flow
     const tags = ["etail 2026"];
 
-    const contactId = await upsertContact({ name, email, phone, customFields, tags });
+    const contactId = await upsertContact({ name, email, phone, customFields, standardFields, tags });
     const appointment = await createAppointment({ 
       contactId, 
       startTime, 
