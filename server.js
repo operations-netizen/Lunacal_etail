@@ -114,7 +114,7 @@ function extractCustomFields(payload) {
         // Handle "contact." prefix or specific IDs
         if (ghlKey.startsWith("contact.")) {
           const fieldName = ghlKey.replace("contact.", "");
-          const topLevelFields = ["address1", "city", "state", "country", "postalCode", "companyName", "website", "dateOfBirth"];
+          const topLevelFields = ["address1", "city", "state", "country", "postalCode", "companyName", "website", "dateOfBirth", "description"];
           
           if (topLevelFields.includes(fieldName)) {
             standardFields[fieldName] = rawValue;
@@ -122,7 +122,12 @@ function extractCustomFields(payload) {
             customFields.push({ id: fieldName, field_value: rawValue });
           }
         } else {
-          customFields.push({ id: ghlKey, field_value: rawValue });
+          // Special case for description ID if passed as custom field ID
+          if (ghlKey === "sNWv53FBcjdPon8r8sLA" || ghlKey === "description") {
+            standardFields["description"] = rawValue;
+          } else {
+            customFields.push({ id: ghlKey, field_value: rawValue });
+          }
         }
 
         console.log(`[Debug] Match found! Label: "${targetLabel}" -> GHL Key: "${ghlKey}", Value: "${rawValue}"`);
